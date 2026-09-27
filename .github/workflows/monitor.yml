@@ -32,7 +32,7 @@ jobs:
         run: node monitor.mjs
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          WATCH_DATES: "2026-10-07,2026-10-08,2026-10-09"
+          WATCH_DATES: "2026-10-06,2026-10-07,2026-10-08,2026-10-09"
           PARTY_SIZE: "2"
           POLL_MINUTES: "50"
           POLL_INTERVAL_SEC: "180"
