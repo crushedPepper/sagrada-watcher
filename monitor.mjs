@@ -7,18 +7,19 @@ import { pathToFileURL } from "node:url";
 
 // ---------- settings (edit these if your plans change) ----------
 export const SETTINGS = {
-  dates: (process.env.WATCH_DATES || "2026-10-07,2026-10-08,2026-10-09")
+  dates: (process.env.WATCH_DATES || "2026-10-06,2026-10-07,2026-10-08,2026-10-09")
     .split(",").map((d) => d.trim()).filter(Boolean),
   partySize: Number(process.env.PARTY_SIZE || 2),
-  product: {
-    id: 4375,
-    venueId: 1,
-    name: "Sagrada Familia (basic entry)",
-    url: "https://tickets.sagradafamilia.org/en/1-individual/4375-sagrada-familia",
-  },
-  pollMinutes: Number(process.env.POLL_MINUTES || 50),     // how long one run keeps watching
+  // venueId differs per ticket type; the wrong one silently returns nothing.
+  products: [
+    { id: 4375, venueId: 1, name: "Basic entry", url: "https://tickets.sagradafamilia.org/en/1-individual/4375-sagrada-familia" },
+    { id: 4374, venueId: 1640, name: "Guided tour", url: "https://tickets.sagradafamilia.org/en/1-individual/4374-sagrada-familia-with-guided-tour" },
+    { id: 4443, venueId: 3, name: "With towers", url: "https://tickets.sagradafamilia.org/en/1-individual/4443-sagrada-familia-with-towers" },
+    { id: 4779, venueId: 1783, name: "Guided tour + towers", url: "https://tickets.sagradafamilia.org/en/1-individual/4779-sagrada-familia-with-guide-and-visit-to-the-towers" },
+  ],
+  pollMinutes: Number(process.env.POLL_MINUTES || 50),           // how long one run keeps watching
   pollIntervalSec: Number(process.env.POLL_INTERVAL_SEC || 180), // gap between checks
-  repeatAfterHours: 1, // re-alert about a still-open date at most once an hour
+  repeatAfterHours: 1, // re-alert about the same opening at most once an hour
 };
 
 const API = "https://services.clorian.com";
@@ -62,7 +63,7 @@ async function getToken() {
 }
 
 // Returns { "YYYY-MM-DD": "availability" | other, ... } for every month the dates touch.
-async function getCalendar(token, minTickets) {
+async function getCalendar(token, product, minTickets) {
   const months = [...new Set(SETTINGS.dates.map((d) => d.slice(0, 7)))];
   const calendar = {};
   for (const ym of months) {
@@ -70,14 +71,15 @@ async function getCalendar(token, minTickets) {
     const qs = new URLSearchParams({
       minTickets: String(minTickets),
       month: String(Number(month)),
-      venueId: String(SETTINGS.product.venueId),
+      venueId: String(product.venueId),
       year,
     });
     const res = await request(
-      `${API}/catalog/salesGroups/${SALES_GROUP}/product/${SETTINGS.product.id}/availability?${qs}`,
+      `${API}/catalog/salesGroups/${SALES_GROUP}/product/${product.id}/availability?${qs}`,
       { headers: { ...COMMON_HEADERS, authorization: `Bearer ${token}`, pos: POS, "content-type": "application/json" } },
     );
     Object.assign(calendar, await res.json());
+    await sleep(200);
   }
   return calendar;
 }
@@ -86,16 +88,53 @@ export function openDates(calendar, dates = SETTINGS.dates) {
   return dates.filter((d) => calendar?.[d] === "availability");
 }
 
-// One check. Returns the watched dates that have a slot for the whole party.
-export async function check(token) {
-  const permissive = await getCalendar(token, 1);
-  if (Object.keys(permissive).length === 0) {
-    // An empty calendar means the API shape/venue changed, not "sold out".
-    throw new Error("Booking backend returned an empty calendar - the checker may need updating.");
+// Some ticket types ignore the group-size filter (they say "available" even for
+// 100,000 people). For those we can only say a date opened, not how many seats.
+// Checked once per run so the watcher adapts if the booking system changes.
+async function detectGroupFilter(token) {
+  const result = new Map();
+  for (const p of SETTINGS.products) {
+    try {
+      const huge = await getCalendar(token, p, 100000);
+      result.set(p.id, Object.values(huge).every((v) => v !== "availability"));
+    } catch {
+      result.set(p.id, false);
+    }
   }
-  await sleep(300);
-  const forParty = await getCalendar(token, SETTINGS.partySize);
-  return { open: openDates(forParty), anyOpen: openDates(permissive) };
+  return result;
+}
+
+// One check across all ticket types.
+// Returns [{ product, date, level }] where level is:
+//   "party"      - a slot fits the whole group (confirmed)
+//   "unverified" - the date opened; this ticket type can't report group size
+//   "single"     - only a single seat per slot
+export async function check(token, groupFilter) {
+  const found = [];
+  let basicSeen = false;
+  for (const p of SETTINGS.products) {
+    const any = await getCalendar(token, p, 1);
+    if (p.id === 4375) {
+      // Basic entry always returns a full month; empty means the API changed, not "sold out".
+      if (Object.keys(any).length === 0) {
+        throw new Error("Booking backend returned an empty calendar - the checker may need updating.");
+      }
+      basicSeen = true;
+    }
+    const anyOpen = openDates(any);
+    if (!anyOpen.length) continue;
+    if (!groupFilter.get(p.id) || SETTINGS.partySize <= 1) {
+      const level = SETTINGS.partySize <= 1 ? "party" : "unverified";
+      for (const date of anyOpen) found.push({ product: p, date, level });
+      continue;
+    }
+    const partyOpen = openDates(await getCalendar(token, p, SETTINGS.partySize));
+    for (const date of anyOpen) {
+      found.push({ product: p, date, level: partyOpen.includes(date) ? "party" : "single" });
+    }
+  }
+  if (!basicSeen) throw new Error("Basic entry was not checked.");
+  return found;
 }
 
 // ---------- notifications (ntfy.sh) ----------
@@ -115,7 +154,9 @@ async function notify({ title, message, priority = 3, tags = [], click, ref }) {
 async function sentRecently(ref, hours) {
   try {
     const res = await request(`https://ntfy.sh/${TOPIC}/json?poll=1&since=${hours}h`, {}, 1);
-    return (await res.text()).split("\n").some((l) => l.includes(`ref:${ref}`));
+    // The ref is always the last thing in the message, so match it with the closing
+    // quote - otherwise "open:A" would wrongly match an earlier "open:A,B".
+    return (await res.text()).split("\n").some((l) => l.includes(`ref:${ref}"`));
   } catch {
     return false;
   }
@@ -124,29 +165,38 @@ async function sentRecently(ref, hours) {
 const pretty = (d) =>
   new Date(`${d}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
 
-export function buildAlert(open, anyOpen) {
-  if (open.length) {
-    return {
-      title: `Sagrada Familia: tickets OPEN for ${open.map(pretty).join(", ")}`,
-      message: `A time slot with ${SETTINGS.partySize} seats together just appeared. Book fast - these go in minutes.`,
-      priority: 5,
-      tags: ["rotating_light", "ticket"],
-      click: SETTINGS.product.url,
-      ref: `open:${open.join(",")}`,
-    };
-  }
-  const single = anyOpen;
-  if (single.length && SETTINGS.partySize > 1) {
-    return {
-      title: `Sagrada Familia: 1 seat open on ${single.map(pretty).join(", ")}`,
-      message: `Only single seats right now, not ${SETTINGS.partySize} together. You could try booking 1 + 1 in two nearby slots.`,
-      priority: 4,
-      tags: ["ticket"],
-      click: SETTINGS.product.url,
-      ref: `single:${single.join(",")}`,
-    };
-  }
-  return null;
+const RANK = { party: 0, unverified: 1, single: 2 };
+const LABEL = {
+  party: () => `${SETTINGS.partySize} seats together`,
+  unverified: () => "open (this ticket type doesn't say how many seats - check)",
+  single: () => "1 seat per slot only",
+};
+
+export function buildAlert(found) {
+  if (!found.length) return null;
+  const sorted = [...found].sort(
+    (a, b) => RANK[a.level] - RANK[b.level] || a.date.localeCompare(b.date) ||
+      SETTINGS.products.indexOf(a.product) - SETTINGS.products.indexOf(b.product),
+  );
+  const best = sorted[0];
+  const dates = [...new Set(sorted.map((f) => f.date))].sort();
+  const lines = dates.map((d) => {
+    const items = sorted.filter((f) => f.date === d).map((f) => `  - ${f.product.name}: ${LABEL[f.level]()}`);
+    return `${pretty(d)}\n${items.join("\n")}`;
+  });
+  const headline = {
+    party: `${SETTINGS.partySize} tickets OPEN`,
+    unverified: "tickets opening",
+    single: "1 seat open",
+  }[best.level];
+  return {
+    title: `Sagrada Familia: ${headline} - ${best.product.name}, ${pretty(best.date)}`,
+    message: `${lines.join("\n\n")}\n\nTap to open ${best.product.name}. Book fast - these go in minutes.`,
+    priority: best.level === "single" ? 4 : 5,
+    tags: best.level === "single" ? ["ticket"] : ["rotating_light", "ticket"],
+    click: best.product.url,
+    ref: "open:" + sorted.map((f) => `${f.product.id}/${f.date}/${f.level}`).sort().join(","),
+  };
 }
 
 function windowOver() {
@@ -181,9 +231,9 @@ export async function main() {
   if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch" && process.env.TEST_PUSH === "true") {
     await notify({
       title: "Sagrada watcher connected",
-      message: `Watching ${SETTINGS.dates.map(pretty).join(", ")} for ${SETTINGS.partySize} tickets.`,
+      message: `Watching ${SETTINGS.dates.map(pretty).join(", ")} for ${SETTINGS.partySize} tickets, all ticket types.`,
       tags: ["white_check_mark"],
-      click: SETTINGS.product.url,
+      click: SETTINGS.products[0].url,
       ref: `test:${Date.now()}`,
     });
   }
@@ -196,6 +246,9 @@ export async function main() {
 
   const deadline = Date.now() + SETTINGS.pollMinutes * 60_000;
   let token = await getToken();
+  const groupFilter = await detectGroupFilter(token);
+  console.log("Group-size filter works for: " +
+    SETTINGS.products.filter((p) => groupFilter.get(p.id)).map((p) => p.name).join(", "));
   let checks = 0;
   let failures = 0;
   const alreadySent = new Set();
@@ -203,22 +256,21 @@ export async function main() {
   while (Date.now() < deadline) {
     checks++;
     try {
-      const { open, anyOpen } = await check(token);
+      const found = await check(token, groupFilter);
       failures = 0;
-      console.log(`Check ${checks}: open for party=${open.length}, any seat=${anyOpen.length}`);
+      console.log(`Check ${checks}: ${found.length ? found.map((f) => `${f.product.id}:${f.level}`).join(" ") : "nothing open"}`);
 
-      const alert = buildAlert(open, anyOpen);
+      const alert = buildAlert(found);
       if (alert && !alreadySent.has(alert.ref) && !(await sentRecently(alert.ref, SETTINGS.repeatAfterHours))) {
         await notify(alert);
         alreadySent.add(alert.ref);
       }
 
       // Once a day (about 9:00 IST) confirm the watcher is still alive.
-      const now = new Date();
-      if (checks === 1 && now.getUTCHours() === 3 && !(await sentRecently("heartbeat", 6))) {
+      if (checks === 1 && new Date().getUTCHours() === 3 && !(await sentRecently("heartbeat", 6))) {
         await notify({
           title: "Sagrada watcher: still running",
-          message: `Nothing open yet for ${SETTINGS.dates.map(pretty).join(", ")}. If this daily note stops, the watcher has stopped.`,
+          message: `Nothing open yet for ${SETTINGS.dates.map(pretty).join(", ")} (all ticket types). If this daily note stops, the watcher has stopped.`,
           priority: 1,
           tags: ["hourglass"],
           ref: "heartbeat",
