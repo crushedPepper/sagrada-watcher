@@ -35,6 +35,6 @@ jobs:
           WATCH_DATES: "2026-10-06,2026-10-07,2026-10-08,2026-10-09"
           PARTY_SIZE: "2"
           POLL_MINUTES: "50"
-          POLL_INTERVAL_SEC: "180"
+          POLL_INTERVAL_SEC: "30"
           TEST_PUSH: ${{ inputs.test_push }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
