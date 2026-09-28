@@ -191,7 +191,7 @@ export function buildAlert(found) {
   }[best.level];
   return {
     title: `Sagrada Familia: ${headline} - ${best.product.name}, ${pretty(best.date)}`,
-    message: `${lines.join("\n\n")}\n\nTap to open ${best.product.name}. Book fast - these go in minutes.`,
+    message: `${lines.join("\n\n")}\n\nTap to open ${best.product.name} and pick the date. Book fast - these go in minutes. If no time slots show, someone else is holding them in their cart; they may come back when it expires, and you'll get another alert.`,
     priority: best.level === "single" ? 4 : 5,
     tags: best.level === "single" ? ["ticket"] : ["rotating_light", "ticket"],
     click: best.product.url,
@@ -251,7 +251,8 @@ export async function main() {
     SETTINGS.products.filter((p) => groupFilter.get(p.id)).map((p) => p.name).join(", "));
   let checks = 0;
   let failures = 0;
-  const alreadySent = new Set();
+  let lastAlert = null;   // what we last told the user was open, in this run
+  let sawClosed = false;  // this run has seen "nothing open" at least once
 
   while (Date.now() < deadline) {
     checks++;
@@ -261,9 +262,27 @@ export async function main() {
       console.log(`Check ${checks}: ${found.length ? found.map((f) => `${f.product.id}:${f.level}`).join(" ") : "nothing open"}`);
 
       const alert = buildAlert(found);
-      if (alert && !alreadySent.has(alert.ref) && !(await sentRecently(alert.ref, SETTINGS.repeatAfterHours))) {
-        await notify(alert);
-        alreadySent.add(alert.ref);
+      if (alert) {
+        // Alert on every change. The ntfy history check only guards the very start of
+        // a run (so a new run doesn't repeat its predecessor's alert); once this run has
+        // seen tickets disappear, a reappearance is always news.
+        const isNew = alert.ref !== lastAlert?.ref;
+        if (isNew && (sawClosed || lastAlert || !(await sentRecently(alert.ref, SETTINGS.repeatAfterHours)))) {
+          await notify(alert);
+        }
+        lastAlert = alert;
+      } else {
+        if (lastAlert) {
+          await notify({
+            title: "Sagrada Familia: gone again",
+            message: "The tickets from the last alert are no longer showing. Released tickets often get held in someone's cart and come back when that cart expires, so keep the app on - you'll get a new alert if they reappear.",
+            priority: 2,
+            tags: ["x"],
+            ref: `closed:${Date.now()}`,
+          });
+        }
+        lastAlert = null;
+        sawClosed = true;
       }
 
       // Once a day (about 9:00 IST) confirm the watcher is still alive.
