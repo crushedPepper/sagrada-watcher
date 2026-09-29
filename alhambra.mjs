@@ -111,8 +111,14 @@ async function detectGroupFilter(token) {
   const result = new Map();
   for (const p of SETTINGS.products) {
     try {
-      const huge = await getCalendar(token, p, 100000);
-      result.set(p.id, Object.values(huge).every((v) => v !== "availability"));
+      // Query each venue directly: for an impossible party size the backend may return an
+      // empty calendar, which is the expected "no" here, not an API fault.
+      let enforced = true;
+      for (const v of p.venues) {
+        const huge = await getVenueCalendar(token, p, v, 100000);
+        if (Object.values(huge).some((x) => x === "availability")) enforced = false;
+      }
+      result.set(p.id, enforced);
     } catch {
       result.set(p.id, false);
     }
