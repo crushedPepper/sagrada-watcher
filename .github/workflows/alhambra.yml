@@ -1,0 +1,40 @@
+name: Alhambra (Granada Card) ticket watcher
+
+on:
+  schedule:
+    # Backup only: each run starts the next one itself. This restarts the chain if it ever breaks.
+    - cron: "37 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_push:
+        description: "Send a test notification to your phone"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write   # lets a run start the next one, and switch itself off after the trip
+
+concurrency:
+  group: alhambra-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Watch for tickets
+        run: node alhambra.mjs
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          WATCH_DATES: "2026-10-13,2026-10-14"
+          PARTY_SIZE: "2"
+          POLL_MINUTES: "50"
+          POLL_INTERVAL_SEC: "60"
+          TEST_PUSH: ${{ inputs.test_push }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
